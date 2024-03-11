@@ -277,6 +277,10 @@ impl JsonRef {
             for obj_value in obj.values_mut() {
                 self.deref(obj_value, new_id.clone(), used_refs)?
             }
+        } else if let Some(list) = value.as_array_mut() {
+            for list_value in list.iter_mut() {
+                self.deref(list_value, new_id.clone(), used_refs)?
+            }
         }
         Ok(())
     }
