@@ -62,8 +62,6 @@ pub enum Error {
     JSONRefError { source: std::io::Error },
 }
 
-type Result<T, E = Error> = std::result::Result<T, E>;
-
 /// Main struct that holds configuration for a JSONScheama derefferencing.
 ///
 /// Instantiate with
@@ -77,15 +75,28 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 pub struct JsonRef {
     schema_cache: std::collections::HashMap<String, serde_json::Value>,
     reference_key: Option<String>,
+    pub dereference_iterations: u8,
+}
+
+impl Default for JsonRef {
+    fn default() -> Self {
+        Self {
+            schema_cache: std::collections::HashMap::new(),
+            reference_key: None,
+            dereference_iterations: 1,
+        }
+    }
 }
 
 impl JsonRef {
     /// Create a new instance of JsonRef.
-    pub fn new() -> JsonRef {
-        Self {
-            schema_cache: std::collections::HashMap::new(),
-            reference_key: None,
-        }
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn set_dereference_iterations(&mut self, i: u8) -> &mut Self {
+        self.dereference_iterations = i;
+        self
     }
 
     /// Set a key to store the data that the `$ref` replaced.
@@ -122,7 +133,7 @@ impl JsonRef {
 
     /// deref a serde_json value directly. Uses the current working directory for any relative
     /// refs.
-    pub fn deref_value(&mut self, value: &mut serde_json::Value) -> Result<()> {
+    pub fn deref_value(&mut self, value: &mut serde_json::Value) -> Result<(), Error> {
         let anon_file_url = format!(
             "file://{}/anon.json",
             std::env::current_dir()
@@ -132,7 +143,9 @@ impl JsonRef {
         self.schema_cache
             .insert(anon_file_url.clone(), value.clone());
 
-        self.deref(value, anon_file_url, &vec![])?;
+        for _ in 0..self.dereference_iterations {
+            self.deref(value, anon_file_url.clone(), &vec![])?;
+        }
         Ok(())
     }
 
@@ -150,7 +163,7 @@ impl JsonRef {
     /// # let file_expected: Value = serde_json::from_reader(file).unwrap();
     /// # assert_eq!(input_url, file_expected)
     /// ```
-    pub fn deref_url(&mut self, url: &str) -> Result<serde_json::Value> {
+    pub fn deref_url(&mut self, url: &str) -> Result<serde_json::Value, Error> {
         let mut value: serde_json::Value = ureq::get(url)
             .call()
             .map_err(|source| Error::SchemaFromUrl {
@@ -164,7 +177,9 @@ impl JsonRef {
             })?;
 
         self.schema_cache.insert(url.to_string(), value.clone());
-        self.deref(&mut value, url.to_string(), &vec![])?;
+        for _ in 0..self.dereference_iterations {
+            self.deref(&mut value, url.to_string(), &vec![])?;
+        }
         Ok(value)
     }
 
@@ -180,7 +195,10 @@ impl JsonRef {
     /// # let file_expected: serde_json::Value = serde_json::from_reader(file).unwrap();
     /// # assert_eq!(file_example, file_expected)
     /// ```
-    pub fn deref_file(&mut self, file_path: &std::ffi::OsString) -> Result<serde_json::Value> {
+    pub fn deref_file(
+        &mut self,
+        file_path: &std::ffi::OsString,
+    ) -> Result<serde_json::Value, Error> {
         let file = std::fs::File::open(file_path).map_err(|source| Error::SchemaFromFile {
             filename: file_path.to_owned(),
             source,
@@ -195,7 +213,9 @@ impl JsonRef {
             })?;
 
         self.schema_cache.insert(url.clone(), value.clone());
-        self.deref(&mut value, url, &vec![])?;
+        for _ in 0..self.dereference_iterations {
+            self.deref(&mut value, url.clone(), &vec![])?;
+        }
         Ok(value)
     }
 
@@ -204,7 +224,7 @@ impl JsonRef {
         value: &mut serde_json::Value,
         id: String,
         used_refs: &Vec<String>,
-    ) -> Result<()> {
+    ) -> Result<(), Error> {
         let mut new_id = id;
         if let Some(id_value) = value.get("$id") {
             if let Some(id_string) = id_value.as_str() {
@@ -283,7 +303,9 @@ impl JsonRef {
                     let mut new_used_refs = used_refs.clone();
                     new_used_refs.push(ref_url_string);
 
-                    self.deref(&mut schema, ref_no_fragment, &new_used_refs)?;
+                    for _ in 0..self.dereference_iterations {
+                        self.deref(&mut schema, ref_no_fragment.clone(), &new_used_refs)?;
+                    }
                     let old_value = std::mem::replace(value, schema);
 
                     if let Some(reference_key) = &self.reference_key {
@@ -301,7 +323,9 @@ impl JsonRef {
             }
         } else if let Some(list) = value.as_array_mut() {
             for list_value in list.iter_mut() {
-                self.deref(list_value, new_id.clone(), used_refs)?
+                for _ in 0..self.dereference_iterations {
+                    self.deref(list_value, new_id.clone(), used_refs)?
+                }
             }
         }
         Ok(())
@@ -309,111 +333,4 @@ impl JsonRef {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::JsonRef;
-
-    #[test]
-    fn json_no_refs() {
-        let no_ref_example = serde_json::json!({"properties": {"prop1": {"title": "proptitle"}}});
-
-        let mut jsonref = JsonRef::new();
-
-        let mut input = no_ref_example.clone();
-
-        jsonref.deref_value(&mut input).unwrap();
-
-        assert_eq!(input, no_ref_example)
-    }
-
-    #[test]
-    fn json_with_recursion() {
-        let mut simple_refs_example = serde_json::json!(
-            {"properties": {"prop1": {"$ref": "#"}}}
-        );
-
-        let simple_refs_expected = serde_json::json!(
-            {"properties": {"prop1": {"properties": {"prop1": {}}}}
-            }
-        );
-
-        let mut jsonref = JsonRef::new();
-        jsonref.deref_value(&mut simple_refs_example).unwrap();
-        jsonref.set_reference_key("__reference__");
-
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&simple_refs_example).unwrap()
-        );
-
-        assert_eq!(simple_refs_example, simple_refs_expected)
-    }
-
-    #[test]
-    fn simple_from_url() {
-        let mut simple_refs_example = serde_json::json!(
-            {"properties": {"prop1": {"title": "name"},
-                            "prop2": {"$ref": "https://gist.githubusercontent.com/kindly/35a631d33792413ed8e34548abaa9d61/raw/b43dc7a76cc2a04fde2a2087f0eb389099b952fb/test.json", "title": "old_title"}}
-            }
-        );
-
-        let simple_refs_expected = serde_json::json!(
-            {"properties": {"prop1": {"title": "name"},
-                            "prop2": {"title": "title from url", "__reference__": {"title": "old_title"}}}
-            }
-        );
-
-        let mut jsonref = JsonRef::new();
-        jsonref.set_reference_key("__reference__");
-        jsonref.deref_value(&mut simple_refs_example).unwrap();
-
-        assert_eq!(simple_refs_example, simple_refs_expected)
-    }
-
-    #[test]
-    fn nested_with_ref_from_url() {
-        let mut simple_refs_example = serde_json::json!(
-            {"properties": {"prop1": {"title": "name"},
-                            "prop2": {"$ref": "https://gist.githubusercontent.com/kindly/35a631d33792413ed8e34548abaa9d61/raw/0a691c035251f742e8710f71ba92ead307823385/test_nested.json"}}
-            }
-        );
-
-        let simple_refs_expected = serde_json::json!(
-            {"properties": {"prop1": {"title": "name"},
-                            "prop2": {"__reference__": {},
-                                      "title": "title from url",
-                                      "properties": {"prop1": {"title": "sub property title in url"},
-                                                     "prop2": {"__reference__": {}, "title": "sub property title in url"}}
-                            }}
-            }
-        );
-
-        let mut jsonref = JsonRef::new();
-        jsonref.set_reference_key("__reference__");
-        jsonref.deref_value(&mut simple_refs_example).unwrap();
-
-        assert_eq!(simple_refs_example, simple_refs_expected)
-    }
-
-    #[test]
-    fn nested_ref_from_local_file() {
-        let mut jsonref = JsonRef::new();
-        jsonref.set_reference_key("__reference__");
-        let file_example = jsonref
-            .deref_file(
-                &std::path::PathBuf::from_iter(["fixtures", "nested_relative", "base.json"].iter())
-                    .into_os_string(),
-            )
-            .unwrap();
-
-        let file = std::fs::File::open(
-            &std::path::PathBuf::from_iter(["fixtures", "nested_relative", "expected.json"].iter())
-                .into_os_string(),
-        )
-        .unwrap();
-        let file_expected: serde_json::Value = serde_json::from_reader(file).unwrap();
-
-        println!("{}", serde_json::to_string_pretty(&file_example).unwrap());
-
-        assert_eq!(file_example, file_expected)
-    }
-}
+mod test_jsonref;
